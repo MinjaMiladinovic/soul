@@ -1,140 +1,342 @@
 /*
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+ * Copyright 2018 Confluent Inc.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * Licensed under the Confluent Community License (the "License"); you may not use
+ * this file except in compliance with the License.  You may obtain a copy of the
+ * License at
+ *
+ * http://www.confluent.io/confluent-community-license
  *
  * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OF ANY KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations under the License.
  */
 
-package org.dromara.soul.client.springcloud.init;
+package io.confluent.connect.jdbc.sink;
 
-import java.io.IOException;
-import java.lang.reflect.Method;
+import org.apache.kafka.connect.data.Schema;
+import org.apache.kafka.connect.errors.ConnectException;
+import org.apache.kafka.connect.sink.SinkRecord;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
 import java.util.Objects;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
-import lombok.extern.slf4j.Slf4j;
-import org.dromara.soul.client.common.utils.OkHttpTools;
-import org.dromara.soul.client.springcloud.annotation.SoulSpringCloudClient;
-import org.dromara.soul.client.springcloud.config.SoulSpringCloudConfig;
-import org.dromara.soul.client.springcloud.dto.SpringCloudRegisterDTO;
-import org.springframework.beans.BeansException;
-import org.springframework.beans.factory.config.BeanPostProcessor;
-import org.springframework.core.annotation.AnnotationUtils;
-import org.springframework.core.env.Environment;
-import org.springframework.lang.NonNull;
-import org.springframework.stereotype.Controller;
-import org.springframework.util.ReflectionUtils;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RestController;
+import java.util.Optional;
+import java.util.stream.Collectors;
 
-/**
- * The type Soul client bean post processor.
- *
- * @author xiaoyu(Myth)
- */
-@Slf4j
-public class SpringCloudClientBeanPostProcessor implements BeanPostProcessor {
+import io.confluent.connect.jdbc.dialect.DatabaseDialect;
+import io.confluent.connect.jdbc.dialect.DatabaseDialect.StatementBinder;
+import io.confluent.connect.jdbc.sink.metadata.FieldsMetadata;
+import io.confluent.connect.jdbc.sink.metadata.SchemaPair;
+import io.confluent.connect.jdbc.util.ColumnId;
+import io.confluent.connect.jdbc.util.TableId;
 
-    private final ThreadPoolExecutor executorService;
+import static io.confluent.connect.jdbc.sink.JdbcSinkConfig.InsertMode.INSERT;
+import static java.util.Objects.isNull;
+import static java.util.Objects.nonNull;
 
-    private final String url;
+public class BufferedRecords {
+  private static final Logger log = LoggerFactory.getLogger(BufferedRecords.class);
 
-    private final SoulSpringCloudConfig config;
+  private final TableId tableId;
+  private final JdbcSinkConfig config;
+  private final DatabaseDialect dbDialect;
+  private final DbStructure dbStructure;
+  private final Connection connection;
 
-    private final Environment env;
+  private List<SinkRecord> records = new ArrayList<>();
+  private Schema keySchema;
+  private Schema valueSchema;
+  private RecordValidator recordValidator;
+  private FieldsMetadata fieldsMetadata;
+  private PreparedStatement updatePreparedStatement;
+  private PreparedStatement deletePreparedStatement;
+  private StatementBinder updateStatementBinder;
+  private StatementBinder deleteStatementBinder;
+  private boolean deletesInBatch = false;
 
-    /**
-     * Instantiates a new Soul client bean post processor.
-     *
-     * @param config the soul spring cloud config
-     * @param env    the env
-     */
-    public SpringCloudClientBeanPostProcessor(final SoulSpringCloudConfig config, final Environment env) {
-        String contextPath = config.getContextPath();
-        String adminUrl = config.getAdminUrl();
-        String appName = env.getProperty("spring.application.name");
-        if (contextPath == null || "".equals(contextPath)
-                || adminUrl == null || "".equals(adminUrl)
-                || appName == null || "".equals(appName)) {
-            throw new RuntimeException("spring cloud param must config the contextPath, adminUrl and appName");
-        }
-        this.config = config;
-        this.env = env;
-        this.url = adminUrl + "/soul-client/springcloud-register";
-        executorService = new ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, new LinkedBlockingQueue<>());
+  public BufferedRecords(
+      JdbcSinkConfig config,
+      TableId tableId,
+      DatabaseDialect dbDialect,
+      DbStructure dbStructure,
+      Connection connection
+  ) {
+    this.tableId = tableId;
+    this.config = config;
+    this.dbDialect = dbDialect;
+    this.dbStructure = dbStructure;
+    this.connection = connection;
+    this.recordValidator = RecordValidator.create(config);
+  }
+
+  public List<SinkRecord> add(SinkRecord record) throws SQLException {
+    recordValidator.validate(record);
+    final List<SinkRecord> flushed = new ArrayList<>();
+
+    boolean schemaChanged = false;
+    if (!Objects.equals(keySchema, record.keySchema())) {
+      keySchema = record.keySchema();
+      schemaChanged = true;
+    }
+    if (isNull(record.valueSchema())) {
+      // For deletes, value and optionally value schema come in as null.
+      // We don't want to treat this as a schema change if key schemas is the same
+      // otherwise we flush unnecessarily.
+      if (config.deleteEnabled) {
+        deletesInBatch = true;
+      }
+    } else if (Objects.equals(valueSchema, record.valueSchema())) {
+      if (config.deleteEnabled && deletesInBatch) {
+        // flush so an insert after a delete of same record isn't lost
+        flushed.addAll(flush());
+      }
+    } else {
+      // value schema is not null and has changed. This is a real schema change.
+      valueSchema = record.valueSchema();
+      schemaChanged = true;
+    }
+    if (schemaChanged || updateStatementBinder == null) {
+      // Each batch needs to have the same schemas, so get the buffered records out
+      flushed.addAll(flush());
+
+      // re-initialize everything that depends on the record schema
+      final SchemaPair schemaPair = new SchemaPair(
+          record.keySchema(),
+          record.valueSchema()
+      );
+      fieldsMetadata = FieldsMetadata.extract(
+          tableId.tableName(),
+          config.pkMode,
+          config.pkFields,
+          config.fieldsWhitelist,
+          schemaPair
+      );
+      dbStructure.createOrAmendIfNecessary(
+          config,
+          connection,
+          tableId,
+          fieldsMetadata
+      );
+      final String insertSql = getInsertSql();
+      final String deleteSql = getDeleteSql();
+      log.debug(
+          "{} sql: {} deleteSql: {} meta: {}",
+          config.insertMode,
+          insertSql,
+          deleteSql,
+          fieldsMetadata
+      );
+      close();
+      updatePreparedStatement = dbDialect.createPreparedStatement(connection, insertSql);
+      updateStatementBinder = dbDialect.statementBinder(
+          updatePreparedStatement,
+          config.pkMode,
+          schemaPair,
+          fieldsMetadata,
+          config.insertMode
+      );
+      if (config.deleteEnabled && nonNull(deleteSql)) {
+        deletePreparedStatement = dbDialect.createPreparedStatement(connection, deleteSql);
+        deleteStatementBinder = dbDialect.statementBinder(
+            deletePreparedStatement,
+            config.pkMode,
+            schemaPair,
+            fieldsMetadata,
+            config.insertMode
+        );
+      }
+    }
+    
+    // set deletesInBatch if schema value is not null
+    if (isNull(record.value()) && config.deleteEnabled) {
+      deletesInBatch = true;
     }
 
-    @Override
-    public Object postProcessAfterInitialization(@NonNull final Object bean, @NonNull final String beanName) throws BeansException {
-        Controller controller = AnnotationUtils.findAnnotation(bean.getClass(), Controller.class);
-        RestController restController = AnnotationUtils.findAnnotation(bean.getClass(), RestController.class);
-        RequestMapping requestMapping = AnnotationUtils.findAnnotation(bean.getClass(), RequestMapping.class);
-        if (controller != null || restController != null || requestMapping != null) {
-            String contextPath = config.getContextPath();
-            //首先
-            String prePath = "";
-            SoulSpringCloudClient clazzAnnotation = AnnotationUtils.findAnnotation(bean.getClass(), SoulSpringCloudClient.class);
-            if (Objects.nonNull(clazzAnnotation)) {
-                if (clazzAnnotation.path().indexOf("*") > 1) {
-                    String finalPrePath = prePath;
-                    executorService.execute(() -> post(buildJsonParams(clazzAnnotation, contextPath, finalPrePath)));
-                    return bean;
-                }
-                prePath = clazzAnnotation.path();
-            }
-            final Method[] methods = ReflectionUtils.getUniqueDeclaredMethods(bean.getClass());
-            for (Method method : methods) {
-                SoulSpringCloudClient soulSpringCloudClient = AnnotationUtils.findAnnotation(method, SoulSpringCloudClient.class);
-                if (Objects.nonNull(soulSpringCloudClient)) {
-                    String finalPrePath = prePath;
-                    executorService.execute(() -> post(buildJsonParams(soulSpringCloudClient, contextPath, finalPrePath)));
-                }
-            }
-        }
-        return bean;
+    records.add(record);
+
+    if (records.size() >= config.batchSize) {
+      flushed.addAll(flush());
+    }
+    return flushed;
+  }
+
+  public List<SinkRecord> flush() throws SQLException {
+    if (records.isEmpty()) {
+      log.debug("Records is empty");
+      return new ArrayList<>();
+    }
+    log.debug("Flushing {} buffered records", records.size());
+    for (SinkRecord record : records) {
+      if (isNull(record.value()) && nonNull(deleteStatementBinder)) {
+        deleteStatementBinder.bindRecord(record);
+      } else {
+        updateStatementBinder.bindRecord(record);
+      }
+    }
+    Optional<Long> totalUpdateCount = executeUpdates();
+    long totalDeleteCount = executeDeletes();
+
+    final long expectedCount = updateRecordCount();
+    log.trace("{} records:{} resulting in totalUpdateCount:{} totalDeleteCount:{}",
+        config.insertMode, records.size(), totalUpdateCount, totalDeleteCount
+    );
+    if (totalUpdateCount.filter(total -> total != expectedCount).isPresent()
+        && config.insertMode == INSERT) {
+      throw new ConnectException(String.format(
+          "Update count (%d) did not sum up to total number of records inserted (%d)",
+          totalUpdateCount.get(),
+          expectedCount
+      ));
+    }
+    if (!totalUpdateCount.isPresent()) {
+      log.info(
+          "{} records:{} , but no count of the number of rows it affected is available",
+          config.insertMode,
+          records.size()
+      );
     }
 
-    private void post(final String json) {
+    final List<SinkRecord> flushedRecords = records;
+    records = new ArrayList<>();
+    deletesInBatch = false;
+    return flushedRecords;
+  }
+
+  /**
+   * @return an optional count of all updated rows or an empty optional if no info is available
+   */
+  private Optional<Long> executeUpdates() throws SQLException {
+    Optional<Long> count = Optional.empty();
+    for (int updateCount : updatePreparedStatement.executeBatch()) {
+      if (updateCount != Statement.SUCCESS_NO_INFO) {
+        count = count.isPresent()
+            ? count.map(total -> total + updateCount)
+            : Optional.of((long) updateCount);
+      }
+    }
+    return count;
+  }
+
+  private long executeDeletes() throws SQLException {
+    long totalDeleteCount = 0;
+    if (nonNull(deletePreparedStatement)) {
+      for (int updateCount : deletePreparedStatement.executeBatch()) {
+        if (updateCount != Statement.SUCCESS_NO_INFO) {
+          totalDeleteCount += updateCount;
+        }
+      }
+    }
+    return totalDeleteCount;
+  }
+
+  private long updateRecordCount() {
+    return records
+        .stream()
+        // ignore deletes
+        .filter(record -> nonNull(record.value()) || !config.deleteEnabled)
+        .count();
+  }
+
+  public void close() throws SQLException {
+    log.debug(
+        "Closing BufferedRecords with updatePreparedStatement: {} deletePreparedStatement: {}",
+        updatePreparedStatement,
+        deletePreparedStatement
+    );
+    if (nonNull(updatePreparedStatement)) {
+      updatePreparedStatement.close();
+      updatePreparedStatement = null;
+    }
+    if (nonNull(deletePreparedStatement)) {
+      deletePreparedStatement.close();
+      deletePreparedStatement = null;
+    }
+  }
+
+  private String getInsertSql() throws SQLException {
+    switch (config.insertMode) {
+      case INSERT:
+        return dbDialect.buildInsertStatement(
+            tableId,
+            asColumns(fieldsMetadata.keyFieldNames),
+            asColumns(fieldsMetadata.nonKeyFieldNames),
+            dbStructure.tableDefinition(connection, tableId)
+        );
+      case UPSERT:
+        if (fieldsMetadata.keyFieldNames.isEmpty()) {
+          throw new ConnectException(String.format(
+              "Write to table '%s' in UPSERT mode requires key field names to be known, check the"
+                  + " primary key configuration",
+              tableId
+          ));
+        }
         try {
-            String result = OkHttpTools.getInstance().post(url, json);
-            if (Objects.equals(result, "success")) {
-                log.info("http client register success :{} ", json);
-            } else {
-                log.error("http client register error :{} ", json);
-            }
-        } catch (IOException e) {
-            log.error("cannot register soul admin param :{}", url + ":" + json);
+          return dbDialect.buildUpsertQueryStatement(
+              tableId,
+              asColumns(fieldsMetadata.keyFieldNames),
+              asColumns(fieldsMetadata.nonKeyFieldNames),
+              dbStructure.tableDefinition(connection, tableId)
+          );
+        } catch (UnsupportedOperationException e) {
+          throw new ConnectException(String.format(
+              "Write to table '%s' in UPSERT mode is not supported with the %s dialect.",
+              tableId,
+              dbDialect.name()
+          ));
         }
+      case UPDATE:
+        return dbDialect.buildUpdateStatement(
+            tableId,
+            asColumns(fieldsMetadata.keyFieldNames),
+            asColumns(fieldsMetadata.nonKeyFieldNames),
+            dbStructure.tableDefinition(connection, tableId)
+        );
+      default:
+        throw new ConnectException("Invalid insert mode");
     }
+  }
 
-    private String buildJsonParams(final SoulSpringCloudClient soulSpringCloudClient, final String contextPath, final String prePath) {
-        String appName = env.getProperty("spring.application.name");
-        String path = contextPath + prePath + soulSpringCloudClient.path();
-        String desc = soulSpringCloudClient.desc();
-        String configRuleName = soulSpringCloudClient.ruleName();
-        String ruleName = ("".equals(configRuleName)) ? path : configRuleName;
-        SpringCloudRegisterDTO registerDTO = SpringCloudRegisterDTO.builder()
-                .context(contextPath)
-                .appName(appName)
-                .path(path)
-                .pathDesc(desc)
-                .rpcType(soulSpringCloudClient.rpcType())
-                .enabled(soulSpringCloudClient.enabled())
-                .ruleName(ruleName)
-                .build();
-        return OkHttpTools.getInstance().getGosn().toJson(registerDTO);
+  private String getDeleteSql() {
+    String sql = null;
+    if (config.deleteEnabled) {
+      switch (config.pkMode) {
+        case RECORD_KEY:
+          if (fieldsMetadata.keyFieldNames.isEmpty()) {
+            throw new ConnectException("Require primary keys to support delete");
+          }
+          try {
+            sql = dbDialect.buildDeleteStatement(
+                tableId,
+                asColumns(fieldsMetadata.keyFieldNames)
+            );
+          } catch (UnsupportedOperationException e) {
+            throw new ConnectException(String.format(
+                "Deletes to table '%s' are not supported with the %s dialect.",
+                tableId,
+                dbDialect.name()
+            ));
+          }
+          break;
+
+        default:
+          throw new ConnectException("Deletes are only supported for pk.mode record_key");
+      }
     }
+    return sql;
+  }
+
+  private Collection<ColumnId> asColumns(Collection<String> names) {
+    return names.stream()
+        .map(name -> new ColumnId(tableId, name))
+        .collect(Collectors.toList());
+  }
 }
-
-
